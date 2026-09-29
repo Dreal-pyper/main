@@ -100,7 +100,11 @@ padding and restricts the later checks accordingly:
 1. `length` — frame is not exactly 256 bytes for `silent_witness/v2`
 2. `padding` — a video-hash half has a non-zero high 16 bytes
 3. `version_mismatch` — the trailing `circuit_version` field's upper 28 bytes
-   are non-zero, or the decoded u32 differs from `expected_circuit_version` (2)
+   are non-zero, or the decoded u32 differs from `expected_circuit_version` (2).
+   This is deliberately stricter than the selective-disclosure envelope's
+   version *label*, whose parser reads the low 4 bytes and ignores the rest:
+   here the trailer is the binding itself, so a non-canonical encoding of an
+   otherwise-correct version must not pass (`sw2-neg-024-dirty-upper`)
 4. `non_canonical_field` — checked on fields `[0..6]` (the two video-hash
    halves, credential root, nullifier, `verifier_scope`, `epoch`); the domain
    tag and the version trailer are compared byte for byte, never canonicalized
@@ -303,6 +307,12 @@ bytes into one accumulator instead of exiting on the first difference:
 | Python (`backend/verifier_inputs.py`) | `constant_time_equals` (`hmac.compare_digest`) |
 | Browser (`frontend/src/verifierInputs.ts`) | `constantTimeEquals` |
 | Soroban codec (`verifier_inputs.rs`) | `constant_time_eq` |
+
+The `silent_witness/v2` envelope compares its `domain_tag` through the same
+helper, so the scoped frame gets identical treatment to v1 (#368). Its
+`circuit_version` is the exception and does not need the helper: the accepted
+value is a small public constant decoded from a field element, so the check is a
+single arithmetic comparison with no byte-prefix early exit to leak.
 
 The backend metrics token check (`/metrics`) uses `hmac.compare_digest` on both
 candidate headers, matching the existing register API key check.

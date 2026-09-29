@@ -499,6 +499,29 @@ mod constant_time_tests {
         frame
     }
 
+    /// Scope 4, epoch 5, version `EXPECTED_CIRCUIT_VERSION`.
+    fn scoped_frame(domain: &[u8; FIELD_LEN]) -> [u8; SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN] {
+        let mut frame = [0u8; SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN];
+        let mut version = [0u8; FIELD_LEN];
+        version[FIELD_LEN - 1] = EXPECTED_CIRCUIT_VERSION as u8;
+        for (i, part) in [
+            half(),
+            half(),
+            field(7),
+            field(9),
+            field(4),
+            field(5),
+            *domain,
+            version,
+        ]
+        .iter()
+        .enumerate()
+        {
+            frame[i * FIELD_LEN..(i + 1) * FIELD_LEN].copy_from_slice(part);
+        }
+        frame
+    }
+
     fn revocation_frame(domain: &[u8; FIELD_LEN]) -> [u8; REVOCATION_PUBLIC_INPUTS_LEN] {
         let mut frame = [0u8; REVOCATION_PUBLIC_INPUTS_LEN];
         for (i, part) in [field(5), field(9), *domain, field(7)].iter().enumerate() {
@@ -542,6 +565,11 @@ mod constant_time_tests {
             &SILENT_WITNESS_DOMAIN_TAG_BE
         )
         .is_ok());
+        assert!(parse_silent_witness_v2(
+            &scoped_frame(&SILENT_WITNESS_DOMAIN_TAG_BE),
+            &SILENT_WITNESS_DOMAIN_TAG_BE
+        )
+        .is_ok());
         assert!(parse_revocation_witness(
             &revocation_frame(&REVOCATION_DOMAIN),
             &REVOCATION_DOMAIN
@@ -555,6 +583,20 @@ mod constant_time_tests {
             let tampered = flipped(&SILENT_WITNESS_DOMAIN_TAG_BE, index);
             let result =
                 parse_silent_witness(&silent_frame(&tampered), &SILENT_WITNESS_DOMAIN_TAG_BE);
+            assert_eq!(
+                result.err(),
+                Some(RejectCode::DomainMismatch),
+                "byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_v2_domain_flip_is_rejected_at_every_byte() {
+        for index in 0..FIELD_LEN {
+            let tampered = flipped(&SILENT_WITNESS_DOMAIN_TAG_BE, index);
+            let result =
+                parse_silent_witness_v2(&scoped_frame(&tampered), &SILENT_WITNESS_DOMAIN_TAG_BE);
             assert_eq!(
                 result.err(),
                 Some(RejectCode::DomainMismatch),
