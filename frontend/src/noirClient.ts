@@ -1,7 +1,7 @@
 import { UltraHonkBackend } from '@aztec/bb.js'
 import { Noir } from '@noir-lang/noir_js'
 import type { CompiledCircuit } from '@noir-lang/types'
-import { encodeFieldToBytes32Hex, encodePublicInputs } from './verifierInputs'
+import { encodeFieldToBytes32Hex, encodePublicInputs, EXPECTED_CIRCUIT_VERSION } from './verifierInputs'
 import { assertArtifactPair, assertProofOutput, CircuitInputError, prepareSilentWitnessInputs, PUBLIC_FRAMES } from './circuitInputSchema'
 import type { SilentWitnessInput } from './circuitInputSchema'
 
@@ -13,7 +13,7 @@ type SilentWitnessProof = {
   /** 32-byte hex domain tag, present only when the circuit exposes one. */
   domainTag?: string
   proof: string
-  /** Hex-encoded public frame: four published-browser, five unscoped, or seven scoped fields. */
+  /** Hex-encoded public frame: four published-browser, five unscoped, or eight scoped fields. */
   publicInputs: string
   proofBytes: number
   publicInputBytes: number
@@ -72,11 +72,14 @@ export async function generateSilentWitnessProof(input: SilentWitnessInput): Pro
       throw new CircuitInputError('invalid_proof_output')
     }
     const [credentialRoot, nullifier, domainTag] = returned as string[]
+    // The scoped frame is the only one that carries a committed circuit version (#368).
+    const circuitVersion = frame === 'scoped_v2' ? String(EXPECTED_CIRCUIT_VERSION) : null
     const { witness } = await new Noir(mainCircuit).execute({
       ...helperInputs,
       credential_root: credentialRoot,
       nullifier,
       ...(domainTag === undefined ? {} : { domain_tag: domainTag }),
+      ...(circuitVersion === null ? {} : { circuit_version: circuitVersion }),
     })
 
     const backend = new UltraHonkBackend(mainCircuit.bytecode)
@@ -90,6 +93,7 @@ export async function generateSilentWitnessProof(input: SilentWitnessInput): Pro
         verifier_scope: prepared.verifier_scope,
         epoch: prepared.epoch,
         ...(domainTag === undefined ? {} : { domain_tag: domainTag }),
+        ...(circuitVersion === null ? {} : { circuit_version: circuitVersion }),
       }, frame)
       const publicInputHex = encodePublicInputs(proofData.publicInputs, PUBLIC_FRAMES[frame])
       return {

@@ -146,6 +146,7 @@ fn canonical_name(err: RegistryError) -> &'static str {
         RegistryError::InvalidIssuerRotation => "InvalidIssuerRotation",
         RegistryError::IssuerRotationNotFound => "IssuerRotationNotFound",
         RegistryError::IssuerRotationGraceStillActive => "IssuerRotationGraceStillActive",
+        RegistryError::CircuitVersionMismatch => "CircuitVersionMismatch",
     }
 }
 
