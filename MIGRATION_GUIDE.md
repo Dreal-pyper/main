@@ -390,25 +390,60 @@ Hosts can pre-flight the encoding against `classify_public_inputs` before
 submitting a transaction: it is read-only, touches no storage, and returns the
 same stable code in every rejection path.
 
-**Compatibility:** deployment is strictly additive. `register_anonymous_verified`
-continues to accept the bare 224-byte scoped frame and infers its version from
-the length exactly as before, so provers that have not migrated keep registering
-and stored evidence stays verifiable; nothing on chain is rewritten. `hpx-vi/1`
+**What the pinned compiler now says.** `main.nr` needed three mechanical fixes
+before the pinned toolchain (`nargo 1.0.0-beta.9`, `noirc
+1.0.0-beta.9+6abff2f1`) accepted it at all: non-ASCII characters inside comments,
+unqualified `pedersen_hash` calls, and a comptime global initialised with
+`pedersen_hash` — this nargo cannot evaluate that inside a global initializer, so
+the expected domain tag is derived by a function at the test call site instead.
+None of the three touches `fn main`'s constraints. `nargo test` on the package
+passes 21 tests, including `test_circuit_version_downgrade`, which is the
+in-circuit half of the version binding, and now runs in CI (`zk-ci.yml`).
+
+**Which digests moved.** `zk/circuit.provenance.json`'s
+`zk/noir/silent_witness/src/main.nr` entry and the `main.nr` / `lib.rs` pins in
+`release/compatibility-manifest.json` are the digests of the files this change
+actually edits. The compiled scoped ACIR is not a tracked file: `zk/noir/**/target/`
+is gitignored and no `zk/artifacts.manifest.json` has been committed, so
+`artifact_manifest.py verify` stays inert on this branch by design. The tracked
+compiled artifacts are the published browser pair under `frontend/public/noir/`,
+which is the pinned `browser_v1` pair (`artifact_abis.browser_v1` in
+`zk/noir/circuit_input_schema_v1.json` binds its bytecode digests) and is
+deliberately *not* the scoped circuit: `assertArtifactPair` in
+`frontend/src/circuitInputSchema.ts` resolves the browser's frame from that pair,
+and a scoped main placed beside the four-field browser helper resolves to no frame
+at all. #368 therefore leaves `frontend/public/noir/` and
+`zk/browser.artifacts.manifest.json` untouched — publishing a scoped browser pair
+is a separate change that has to move the helper, the schema pins, and the lock
+declarations together.
+
+**Compatibility:** the bare frame is retired by this change. For the scoped path,
+`register_anonymous_verified` accepts **only** the 256-byte enveloped frame. The
+bare 224-byte scoped frame commits no circuit version — its version could only
+ever be *inferred* from its length — so it is rejected with
+`RegistryError::CircuitVersionMismatch` (87) before the verifier is invoked, and
+a proof can no longer skip the version commitment by omitting the trailer.
+Provers that have not migrated must append the trailer; stored evidence is
+unaffected because `circuit_version` is never written to `ProofRecord`. `hpx-vi/1`
 (`silent_witness/v1`, 160 bytes) and `revocation_witness/v1` (128 bytes) are
 byte-for-byte unchanged; `generate_vectors.py` now writes both corpora and
 reproduces `verifier_conformance_v1.json` byte-for-byte, so a version-1 corpus
 re-run still agrees with all three layers. The
 new codec is only reached under the new schema name or the 256-byte length, and
 the strict `silent_witness/v2` parser rejects the bare frame with `length`
-(`sw2-neg-003`) rather than silently reinterpreting it.
+(`sw2-neg-003`) rather than silently reinterpreting it; the on-chain path now
+refuses the same frame by name instead of admitting it.
 
 `release/compatibility-manifest.json` deliberately keeps
-`proof_public_inputs_version: 1`. The frame addition is additive — every frame
-the v1 interface describes still validates identically — and both
-`devx/release_guard.py` and `devx/compatibility_report.py` fail closed on that
-value, so advancing it is a release-cutting decision (pin the new digests and
-`release/verifier-binding.json` together) rather than something this change can
-assert on its own.
+`proof_public_inputs_version: 1`. That value is pinned by tooling, not by
+judgement: `devx/compatibility_report.py` asserts it equals 1, `devx/release_guard.py`
+compares the whole `compatibility` block verbatim, and it must keep matching
+`release/verifier-binding.json`'s `public_inputs_version`. Retiring the bare
+224-byte frame *is* an interface change — it removes a frame the registration path
+used to accept — so a release cut should weigh advancing the value, with the new
+digests and `release/verifier-binding.json` pinned in the same commit. Doing that
+here would mean editing the release tooling from inside a zk change, which this
+change cannot assert on its own.
 
 **Rollback:** reverting to a pre-#368 wasm, backend, or browser bundle needs no
 state migration — `circuit_version` is not stored in `ProofRecord`, so records
@@ -417,5 +452,8 @@ unread. The direction to watch is an old verifier with a migrated prover, and it
 fails **closed**: pre-#368 layers dispatch the scoped path on an exact 224-byte
 length, so a 256-byte envelope hits the `else` branch and reverts with
 `InvalidPublicInputs` (the codec side reports `length`). Rolling the verifier
-back therefore also requires provers to go back to the bare frame; no acceptance
-is ever widened and no stored evidence is affected.
+back therefore also requires provers to go back to the bare frame, which
+re-opens exactly the hole this change closes: a pre-#368 verifier infers the
+version from the length instead of reading the commitment. Roll the circuit and
+its consumers forward, not the verifier back. No stored evidence is affected in
+either direction.

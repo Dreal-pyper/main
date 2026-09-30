@@ -529,16 +529,15 @@ limitation).
    encoding of the version field — is rejected with `version_mismatch` (codec) or
    `CircuitVersionMismatch` (87, on-chain), and the strict `silent_witness/v2`
    parser refuses a truncated 224-byte frame with `length` rather than
-   reinterpreting it. One legacy hole is deliberately left open for
-   compatibility: `register_anonymous_verified` still admits the bare 224-byte
-   scoped frame, whose version stays *inferred* from that length, so a proof from
-   the pre-#368 (nine-parameter) circuit can still register through it. Closing
-   that last
-   hole means retiring the bare frame, which is a rollout step (see
-   `MIGRATION_GUIDE.md`), not something a verifier can do while stored evidence
-   and un-migrated provers are live. What also remains is the digest binding
-   described below: version *n* is not yet cryptographically tied to a specific
-   verification key.
+   reinterpreting it. The last hole of this class is now closed as well:
+   `register_anonymous_verified` used to admit the bare 224-byte scoped frame,
+   whose version stayed *inferred* from that length and so let a proof from the
+   pre-#368 (nine-parameter) circuit register. That length is now rejected with
+   `CircuitVersionMismatch` (87) before the verifier is reached, so no scoped
+   proof can skip the version commitment by omitting the trailer; provers must
+   migrate (see `MIGRATION_GUIDE.md`). What
+   remains is the digest binding described below: version *n* is not yet
+   cryptographically tied to a specific verification key.
    See [Open Risk OR-5](#or-5-circuit-artifact-version-alignment).
 
 **Severity:** Critical (OR-1 stub path). Low (verified path via `register_anonymous_verified`).
@@ -818,6 +817,22 @@ against it rather than each inferring its own. `test_circuit_version_downgrade`
 and the `sw2-neg-02x` / `sw2-neg-07x` corpus cases fail if the Noir global, the
 three codecs, and the corpus drift apart. The digest half above — version *n* to
 verification-key binding — is still open and remains this risk's core.
+
+**What #368 found about that control:** the published browser pair is not a build
+of the tracked scoped sources. `frontend/public/noir/silent_witness.json` is the
+four-field `browser_v1` circuit (six ABI parameters, helper returns two fields) and
+`zk/noir/silent_witness/src/main.nr` is the scoped circuit (nine on `main`, ten
+with `circuit_version`), so `compare_published_to_targets` reports drift for both
+stems the moment a build target exists — `465e556f5904e7bc` against
+`b296e2d6a753b579` for `silent_witness`, `a141350e3c2f83fb` against `3c3dc8a7055ce312`
+for the helper. CI never sees it because `zk/noir/**/target/` is gitignored, which
+means the "required to match it" column above is inert in practice, and
+`assertArtifactPair` keeps the browser pinned to `browser_v1` by bytecode digest
+instead. Publishing a scoped browser pair means moving the main artifact, the
+helper artifact, the `artifact_abis.scoped_v2` entry and
+`zk/toolchain.lock.json`'s `published_acir` declarations together; a scoped main
+beside the four-field helper resolves to no frame at all, so a partial publish
+fails the browser closed.
 
 ---
 

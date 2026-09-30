@@ -223,48 +223,50 @@ nullifier, and that an unknown `schema_id` returns a code rather than panicking.
 `hpx-vi/1` handling is byte-for-byte unchanged, and an unknown schema id still
 returns a code rather than panicking.
 
-On the registration path (`register_anonymous_verified`), #368 made the
-versioned envelope **opt-in** rather than a forced break:
+On the registration path (`register_anonymous_verified`) the versioned envelope
+is **required**:
 
-- A bare 224-byte scoped frame keeps the pre-#368 behavior: it commits no
-  version, so the registry still *infers* circuit version 2 from the length.
-  In-flight proofs keep registering, and stored evidence is untouched.
 - A 256-byte envelope appends the 32-byte `circuit_version` field that the
   circuit itself asserted in-circuit. It must decode to
   `EXPECTED_CIRCUIT_VERSION` (2); anything else — a stale version, zero, a
   non-canonical trailer — is rejected with
   `RegistryError::CircuitVersionMismatch` (#87).
+- A bare 224-byte scoped frame commits no version at all, so its circuit version
+  could only ever be *inferred* from the length. It is rejected with
+  `RegistryError::CircuitVersionMismatch` (#87) before the verifier is reached,
+  so no scoped proof can skip the commitment by omitting the trailer.
 
-That asymmetry is deliberate and is pinned by `sw2-neg-003-truncated-one-field`:
-the *strict* codec (`classify_public_inputs`, schema `silent_witness/v2`) rejects
-a 224-byte frame with `length`, because a frame that names no circuit cannot be
-classified as one. The registration path is the legacy-lenient boundary, the
-codec is the canonical one; only the codec is allowed to describe `hpx-vi/2`.
+`sw2-neg-003-truncated-one-field` pins the two layers agreeing on that frame
+without agreeing on the wording: the *strict* codec
+(`classify_public_inputs`, schema `silent_witness/v2`) rejects it with `length`,
+because a frame that names no circuit cannot be classified as one, and the
+registry rejects it with the dedicated error 87 rather than the generic
+`InvalidPublicInputs`. Stored evidence is untouched either way, because
+`circuit_version` is never written to `ProofRecord`.
 
 Migration for provers:
 
 1. Confirm every in-flight prover emits canonical frames (use
    `classify_public_inputs` as a pre-flight — that is what it is for).
 2. Ship the v2 codec id (`hpx-vi/2`) and the envelope trailer behind the new
-   constants, without tightening any existing function's accepted lengths in
-   place (a bare 224-byte frame must still register).
-3. Have provers re-point their public-input encoding at the versioned frame; the
-   committed version, not the byte length, is what the verifier trusts from now
-   on.
+   constants.
+3. Re-point the public-input encoding at the versioned frame; the committed
+   version, not the byte length, is what the verifier trusts from now on.
 4. Update both corpora `version` fields and this document in the same commit.
 
 **Rollback:** deploying a pre-#368 wasm removes the `silent_witness/v2` schema
 from `classify_public_inputs` and rejects the 256-byte envelope (224-byte-only,
-as before); bare scoped frames and every v1 frame keep registering, so nothing
-persisted is misread by the older contract. Records written through the
-envelope are ordinary `ProofRecord`s with no version marker, so a rollback does
-not orphan them.
+as before), so rolling back means provers go back to the bare frame — exactly the
+acceptance this change closes. Records written through the envelope are ordinary
+`ProofRecord`s with no version marker, so nothing persisted is misread by the
+older contract.
 
 **External verifiers:** the proof-verifier contract receives the whole public
 -input blob, so any verifier that whitelists frame lengths must learn 256
-alongside 128 / 160 / 224. The registry's own test doubles that whitelist lengths
-are updated where the change is exercised (`MockScopedVerifier`); the others are
-left untouched because they never see an enveloped frame.
+alongside 128 / 160. The registry's own test doubles still list 224 as well: they
+stand in for the barretenberg verifier and model the lengths *it* can parse, not
+the registry's frame policy, and a bare frame now reaches them only if a test
+calls the double directly.
 
 ## Running the runners
 

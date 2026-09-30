@@ -53,13 +53,16 @@ signature produces, with the circuit version committed as its trailing field:
 [192..224) domain_tag
 [224..256) circuit_version
 
-Note: the registry has always *parsed* the 224-byte scoped frame on the
-registration path, but no codec described it, and its circuit version was
-*inferred from the byte length*. `silent_witness/v2` closes that gap: every
-public circuit input is encoded, and the proof names the circuit that produced
-it. The published four-field browser frame (`browser_v1` in
-`zk/noir/circuit_input_schema_v1.json`) is unchanged — it is a separate, older
-artifact, and the versioned envelope never replaces a frame already on chain.
+Note: the registry used to *parse* the 224-byte scoped frame on the registration
+path, but no codec described it, and its circuit version was *inferred from the
+byte length*. `silent_witness/v2` closes that gap: every public circuit input is
+encoded, and the proof names the circuit that produced it. The registration path
+no longer accepts that bare frame either — it is rejected with
+`RegistryError::CircuitVersionMismatch` (87) — so a 256-byte envelope is the only
+scoped frame a verifier will act on. The published four-field browser frame
+(`browser_v1` in `zk/noir/circuit_input_schema_v1.json`) is unchanged — it is a
+separate, older artifact, and the versioned envelope never replaces a frame
+already recorded on chain.
 
 ## 3. Statement (as currently enforced)
 
@@ -209,5 +212,6 @@ credential root, nullifier, domain tag) and the `silent_witness/v2` frame,
 which additionally carries `verifier_scope`, `epoch` and the committed
 `circuit_version`. The v2 corpus is the versioned, self-describing frame: a
 frame that names no circuit cannot be classified as `silent_witness/v2`, so the
-bare 224-byte scoped frame is rejected there with `length` and remains a
-registration-path legacy layout only.
+bare 224-byte scoped frame is rejected there with `length`, and the registration
+path rejects the same frame with `CircuitVersionMismatch` (87). It is no longer a
+layout any boundary accepts.
