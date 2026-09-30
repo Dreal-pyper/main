@@ -1184,6 +1184,83 @@ pub struct SchemaUpgraded {
     pub current: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Paginated verifier-set inspection
+// ---------------------------------------------------------------------------
+//
+// `list_verifiers` returns a bounded, stable page of the current verifier
+// configuration — the active slot, the pending slot (if a rotation is
+// scheduled), and the previous slot (if within the rollback window).
+//
+// Design constraints:
+//   - Callers supply a u32 `cursor` (slot index, 0-based) and a `limit` (max
+//     entries per page). Cursor 0 starts at the first populated slot.
+//   - A cursor beyond the end of the populated slot list returns an empty
+//     page — not an error — so callers can safely probe with any cursor.
+//   - `limit` must be non-zero and at most MAX_VERIFIER_LIST_LIMIT.
+//   - No authentication is required (identical to `get_verifier`).
+//   - Slots are always ordered: Active → Pending → Previous.
+//     This ordering is stable across rotation events, so callers can page
+//     incrementally without re-reading prior pages.
+//   - Only populated (non-None) slots appear in `entries`, so the
+//     `next_cursor` can skip unpopulated slots.
+//   - `total_populated` exposes the total number of non-None slots at call
+//     time; it is informational only and safe to expose because addresses
+//     are already visible via `get_verifier` / `get_verifier_state`.
+//
+// Privacy invariants:
+//   - No private witness values, credential secrets, video hashes, or
+//     nullifiers are surfaced through this function.
+//   - An out-of-range cursor returns a stable empty page (not a
+//     revealing error) so a scanner cannot enumerate capacity by probing.
+//
+// Migration: These are new, additive storage keys and a new contract
+// entry point. Existing deployments return an empty VerifierPage until
+// `set_verifier` or a rotation is configured. Rolling back to a pre-this
+// wasm simply removes the entry point; callers fall back to `get_verifier`.
+
+/// Maximum number of verifier entries a single `list_verifiers` call may return.
+pub const MAX_VERIFIER_LIST_LIMIT: u32 = 10;
+
+/// The role of a verifier address in the current rotation state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum VerifierRole {
+    Active = 1,
+    Pending = 2,
+    Previous = 3,
+}
+
+/// A single verifier slot returned by `list_verifiers`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierEntry {
+    /// The verifier contract address for this slot.
+    pub address: Address,
+    /// The role of this verifier in the current configuration.
+    pub role: VerifierRole,
+}
+
+/// Paginated result from `list_verifiers`.
+///
+/// `entries` contains up to `limit` `VerifierEntry` items in slot order
+/// (Active → Pending → Previous). Only non-None slots are included.
+///
+/// `next_cursor` is `Some(offset)` when more items exist beyond this page,
+/// or `None` when the page is the last (or only) page. Pass `next_cursor`
+/// as the `cursor` argument in the subsequent call.
+///
+/// `total_populated` is the total count of populated (non-None) verifier
+/// slots at the time of the query. It is always ≤ 3.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierPage {
+    pub entries: SorobanVec<VerifierEntry>,
+    pub next_cursor: Option<u32>,
+    pub total_populated: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -1262,7 +1339,10 @@ pub enum RegistryError {
     UnknownCredentialRoot = 11,
     RevokedCredentialRoot = 12,
     HistorySaturated = 13,
-    InvalidHistoryAction = 14,
+    /// The scoped-nullifier proof carries an epoch that does not match the
+    /// current on-chain epoch for its scope. Replaces the unused
+    /// `InvalidHistoryAction` slot so the wire code does not change.
+    StaleEpoch = 14,
     InvalidReasonCode = 15,
     HistoryLimitExceeded = 16,
     AlreadyExpired = 17,
@@ -1313,6 +1393,11 @@ pub enum RegistryError {
     UnknownSchema = 50,
     InactiveSchema = 51,
     SchemaVersionMismatch = 52,
+    /// The cursor supplied to `list_verifiers` is out of range or malformed.
+    /// Returns a stable, privacy-safe failure that does not reveal set size.
+    InvalidCursor = 53,
+    /// The `limit` supplied to `list_verifiers` exceeds `MAX_VERIFIER_LIST_LIMIT`.
+    ListLimitExceeded = 54,
     // --- Restored feature errors (append-only; never renumber existing) ---
     /// A scoped-nullifier proof was generated for a stale scope epoch.
     StaleEpoch = 53,
@@ -3863,6 +3948,91 @@ impl HarpocratesRegistry {
     }
 
     // -----------------------------------------------------------------------
+    // Paginated verifier-set inspection
+    // -----------------------------------------------------------------------
+
+    /// Return a bounded, stable page of the current verifier configuration.
+    ///
+    /// Slots are ordered: **Active → Pending → Previous**. Only non-None
+    /// slots appear in `entries`. `cursor` is a 0-based slot index; pass
+    /// `next_cursor` from the previous response to continue paging.
+    ///
+    /// # Arguments
+    ///
+    /// * `cursor` – starting slot index (0 = first populated slot). A cursor
+    ///   beyond the end of the populated list returns an empty page.
+    /// * `limit`  – maximum entries per page. Must be non-zero and at most
+    ///   `MAX_VERIFIER_LIST_LIMIT`. Returns `ListLimitExceeded` otherwise.
+    ///
+    /// # Privacy
+    ///
+    /// This is a read-only query equivalent to `get_verifier` — no private
+    /// witness values, credential secrets, nullifiers, or video hashes are
+    /// surfaced. An out-of-range cursor produces an empty page rather than a
+    /// revealing error, so a scanner cannot enumerate capacity by probing.
+    ///
+    /// # Migration / compatibility
+    ///
+    /// Additive: before any verifier is configured, returns an empty page.
+    /// Callers that only need the active verifier should use `get_verifier`.
+    pub fn list_verifiers(env: Env, cursor: u32, limit: u32) -> VerifierPage {
+        if limit == 0 || limit > MAX_VERIFIER_LIST_LIMIT {
+            panic_with_error!(&env, RegistryError::ListLimitExceeded);
+        }
+
+        // Build the ordered, flattened slot list from storage.
+        // Slots are built deterministically: Active → Pending → Previous.
+        // This avoids heap allocation of a variable-length list in no_std by
+        // using a fixed-size array of Option<VerifierEntry>.
+        let slots = collect_verifier_slots(&env);
+
+        // Count the total populated (non-None) slots across all positions.
+        let total_populated: u32 = slots.iter().filter(|s| s.is_some()).count() as u32;
+
+        let slot_len = slots.len() as u32;
+
+        // A cursor beyond the slot list always returns an empty page.
+        // This is intentional: it does not reveal the set size via an error.
+        let mut entries: SorobanVec<VerifierEntry> = SorobanVec::new(&env);
+        if cursor >= slot_len {
+            return VerifierPage {
+                entries,
+                next_cursor: None,
+                total_populated,
+            };
+        }
+
+        // Walk from `cursor` up to `limit` items, skipping None slots.
+        let mut idx = cursor;
+        let mut filled: u32 = 0;
+        while idx < slot_len && filled < limit {
+            if let Some(entry) = slots[idx as usize].clone() {
+                entries.push_back(entry);
+                filled += 1;
+            }
+            idx += 1;
+        }
+
+        // `next_cursor` is Some if there are any remaining slots (None or Some)
+        // that we have not yet reached. We only set it if there is actually
+        // a remaining populated slot; empty slots beyond are not worth paging.
+        let next_cursor = if idx < slot_len {
+            // Check whether any remaining slot is populated.
+            let has_more = slots[idx as usize..].iter().any(|s| s.is_some());
+            if has_more { Some(idx) } else { None }
+        } else {
+            None
+        };
+
+        VerifierPage {
+            entries,
+            next_cursor,
+            total_populated,
+        }
+    }
+}
+
+    // -----------------------------------------------------------------------
     // Dispute / correction state machine (#dispute)
     // -----------------------------------------------------------------------
 
@@ -4446,6 +4616,46 @@ fn get_verifier_rotation_state(env: &Env) -> VerifierState {
             rollback_window: 0,
             rollback_window_end: 0,
         })
+}
+
+/// Build the ordered, fixed-size slot list for `list_verifiers`.
+///
+/// Returns exactly 3 entries in role order: [Active, Pending, Previous].
+/// Each entry is `None` if the corresponding slot is unpopulated.
+///
+/// The active slot is read from `DataKey::Verifier` (the canonical active
+/// address) first. If `DataKey::VerifierState` is present the pending and
+/// previous slots are taken from it. When the VerifierState carries an
+/// `active_verifier` that differs from `DataKey::Verifier` (e.g. mid-
+/// rotation) the `DataKey::Verifier` value is authoritative for the Active
+/// slot, matching the semantics of `get_verifier`.
+fn collect_verifier_slots(env: &Env) -> [Option<VerifierEntry>; 3] {
+    let active_addr: Option<Address> = env.storage().persistent().get(&DataKey::Verifier);
+
+    let state_opt: Option<VerifierState> =
+        env.storage().persistent().get(&DataKey::VerifierState);
+
+    let active_entry = active_addr.map(|addr| VerifierEntry {
+        address: addr,
+        role: VerifierRole::Active,
+    });
+
+    let (pending_entry, previous_entry) = match state_opt {
+        Some(state) => {
+            let pending = state.pending_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Pending,
+            });
+            let previous = state.previous_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Previous,
+            });
+            (pending, previous)
+        }
+        None => (None, None),
+    };
+
+    [active_entry, pending_entry, previous_entry]
 }
 
 fn require_active_credential_root(env: &Env, credential_root: &BytesN<32>) {
@@ -5558,6 +5768,9 @@ pub mod test_timelock;
 #[cfg(test)]
 mod test_timestamp_claim;
 #[cfg(test)]
+mod test_selective_disclosure;
+#[cfg(test)]
+mod test_list_verifiers;
 mod test_upgrade_compat;
 #[cfg(test)]
 mod test_verifier_versions;
