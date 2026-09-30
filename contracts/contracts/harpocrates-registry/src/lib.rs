@@ -343,6 +343,7 @@ pub enum ProposalAction {
     RevokeIssuer = 2,
     SetProofTtl = 3,
     RevokeCredentialRoot = 4,
+    ExpireCredentialRoot = 5,
 }
 
 pub const DEFAULT_SCOPE_EPOCH: u64 = 0;
@@ -555,10 +556,19 @@ pub struct IssuerRotationRecord {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CredentialRootRecord {
+pub struct CredentialRootRecordV1 {
     pub metadata_hash: BytesN<32>,
     pub active: bool,
     pub issued_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialRootRecord {
+    pub metadata_hash: BytesN<32>,
+    pub status: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
 }
 
 /// Pause record for a single registration domain bit. Presence of a record
@@ -742,6 +752,13 @@ pub struct CredentialRootAdded {
 pub struct CredentialRootRevoked {
     #[topic]
     pub credential_root: BytesN<32>,
+}
+
+#[contractevent(topics = ["credroot", "expire"])]
+pub struct CredentialRootExpired {
+    #[topic]
+    pub credential_root: BytesN<32>,
+    pub expired_at: u64,
 }
 
 /// Domain-separated, privacy-safe proof lifecycle history event (#90).
@@ -1203,12 +1220,90 @@ pub struct TimelockMinDelaySet {
 #[repr(u32)]
 pub enum SchemaVersion {
     V1 = 1,
+    V2 = 2,
 }
 
 #[contractevent(topics = ["schema", "upgrade"])]
 pub struct SchemaUpgraded {
     pub previous: u32,
     pub current: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Paginated verifier-set inspection
+// ---------------------------------------------------------------------------
+//
+// `list_verifiers` returns a bounded, stable page of the current verifier
+// configuration — the active slot, the pending slot (if a rotation is
+// scheduled), and the previous slot (if within the rollback window).
+//
+// Design constraints:
+//   - Callers supply a u32 `cursor` (slot index, 0-based) and a `limit` (max
+//     entries per page). Cursor 0 starts at the first populated slot.
+//   - A cursor beyond the end of the populated slot list returns an empty
+//     page — not an error — so callers can safely probe with any cursor.
+//   - `limit` must be non-zero and at most MAX_VERIFIER_LIST_LIMIT.
+//   - No authentication is required (identical to `get_verifier`).
+//   - Slots are always ordered: Active → Pending → Previous.
+//     This ordering is stable across rotation events, so callers can page
+//     incrementally without re-reading prior pages.
+//   - Only populated (non-None) slots appear in `entries`, so the
+//     `next_cursor` can skip unpopulated slots.
+//   - `total_populated` exposes the total number of non-None slots at call
+//     time; it is informational only and safe to expose because addresses
+//     are already visible via `get_verifier` / `get_verifier_state`.
+//
+// Privacy invariants:
+//   - No private witness values, credential secrets, video hashes, or
+//     nullifiers are surfaced through this function.
+//   - An out-of-range cursor returns a stable empty page (not a
+//     revealing error) so a scanner cannot enumerate capacity by probing.
+//
+// Migration: These are new, additive storage keys and a new contract
+// entry point. Existing deployments return an empty VerifierPage until
+// `set_verifier` or a rotation is configured. Rolling back to a pre-this
+// wasm simply removes the entry point; callers fall back to `get_verifier`.
+
+/// Maximum number of verifier entries a single `list_verifiers` call may return.
+pub const MAX_VERIFIER_LIST_LIMIT: u32 = 10;
+
+/// The role of a verifier address in the current rotation state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum VerifierRole {
+    Active = 1,
+    Pending = 2,
+    Previous = 3,
+}
+
+/// A single verifier slot returned by `list_verifiers`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierEntry {
+    /// The verifier contract address for this slot.
+    pub address: Address,
+    /// The role of this verifier in the current configuration.
+    pub role: VerifierRole,
+}
+
+/// Paginated result from `list_verifiers`.
+///
+/// `entries` contains up to `limit` `VerifierEntry` items in slot order
+/// (Active → Pending → Previous). Only non-None slots are included.
+///
+/// `next_cursor` is `Some(offset)` when more items exist beyond this page,
+/// or `None` when the page is the last (or only) page. Pass `next_cursor`
+/// as the `cursor` argument in the subsequent call.
+///
+/// `total_populated` is the total count of populated (non-None) verifier
+/// slots at the time of the query. It is always ≤ 3.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierPage {
+    pub entries: SorobanVec<VerifierEntry>,
+    pub next_cursor: Option<u32>,
+    pub total_populated: u32,
 }
 
 #[contracttype]
@@ -1218,6 +1313,7 @@ pub enum DataKey {
     Video(BytesN<32>),
     Nullifier(BytesN<32>),
     CredentialRoot(BytesN<32>),
+    CredentialRootV2(BytesN<32>),
     Issuer(Address),
     /// Rotation grace record for an issuer key that has rotated out (#323).
     IssuerRotation(Address),
@@ -1289,7 +1385,10 @@ pub enum RegistryError {
     UnknownCredentialRoot = 11,
     RevokedCredentialRoot = 12,
     HistorySaturated = 13,
-    InvalidHistoryAction = 14,
+    /// The scoped-nullifier proof carries an epoch that does not match the
+    /// current on-chain epoch for its scope. Replaces the unused
+    /// `InvalidHistoryAction` slot so the wire code does not change.
+    StaleEpoch = 14,
     InvalidReasonCode = 15,
     HistoryLimitExceeded = 16,
     AlreadyExpired = 17,
@@ -1340,6 +1439,11 @@ pub enum RegistryError {
     UnknownSchema = 50,
     InactiveSchema = 51,
     SchemaVersionMismatch = 52,
+    /// The cursor supplied to `list_verifiers` is out of range or malformed.
+    /// Returns a stable, privacy-safe failure that does not reveal set size.
+    InvalidCursor = 53,
+    /// The `limit` supplied to `list_verifiers` exceeds `MAX_VERIFIER_LIST_LIMIT`.
+    ListLimitExceeded = 54,
     // --- Restored feature errors (append-only; never renumber existing) ---
     /// A scoped-nullifier proof was generated for a stale scope epoch.
     StaleEpoch = 53,
@@ -1351,6 +1455,7 @@ pub enum RegistryError {
     BatchCountMismatch = 56,
     /// A lineage parent proof/lineage record was not found.
     InvalidLineage = 57,
+    ExpiredCredentialRoot = 58,
     /// A lineage edge would introduce a cycle.
     LineageCycle = 58,
     /// The requested lineage depth exceeds `MAX_LINEAGE_DEPTH`.
@@ -1468,7 +1573,7 @@ impl HarpocratesRegistry {
             .get(&DataKey::SchemaVersion)
             .unwrap_or(SchemaVersion::V1 as u32);
 
-        let target_version = SchemaVersion::V1 as u32;
+        let target_version = SchemaVersion::V2 as u32;
 
         // Legacy pre-#85 registries: stamp V1 without a SchemaUpgraded event.
         if !had_version {
@@ -1792,11 +1897,12 @@ impl HarpocratesRegistry {
 
         let issued_at = env.ledger().timestamp();
         env.storage().persistent().set(
-            &DataKey::CredentialRoot(credential_root.clone()),
+            &DataKey::CredentialRootV2(credential_root.clone()),
             &CredentialRootRecord {
                 metadata_hash: metadata_hash.clone(),
-                active: true,
+                status: STATUS_REGISTERED,
                 issued_at,
+                expires_at: 0,
             },
         );
         CredentialRootAdded {
@@ -1811,11 +1917,23 @@ impl HarpocratesRegistry {
         require_admin(&env, &admin);
 
         let mut record = get_credential_root_record(&env, &credential_root);
-        record.active = false;
+        record.status = STATUS_REVOKED;
         env.storage()
             .persistent()
-            .set(&DataKey::CredentialRoot(credential_root.clone()), &record);
+            .set(&DataKey::CredentialRootV2(credential_root.clone()), &record);
         CredentialRootRevoked { credential_root }.publish(&env);
+    }
+
+    pub fn expire_credential_root(env: Env, admin: Address, credential_root: BytesN<32>) {
+        require_admin(&env, &admin);
+
+        let mut record = get_credential_root_record(&env, &credential_root);
+        record.status = STATUS_EXPIRED;
+        record.expires_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::CredentialRootV2(credential_root.clone()), &record);
+        CredentialRootExpired { credential_root, expired_at: record.expires_at }.publish(&env);
     }
 
     pub fn get_credential_root(
@@ -3918,6 +4036,91 @@ impl HarpocratesRegistry {
     }
 
     // -----------------------------------------------------------------------
+    // Paginated verifier-set inspection
+    // -----------------------------------------------------------------------
+
+    /// Return a bounded, stable page of the current verifier configuration.
+    ///
+    /// Slots are ordered: **Active → Pending → Previous**. Only non-None
+    /// slots appear in `entries`. `cursor` is a 0-based slot index; pass
+    /// `next_cursor` from the previous response to continue paging.
+    ///
+    /// # Arguments
+    ///
+    /// * `cursor` – starting slot index (0 = first populated slot). A cursor
+    ///   beyond the end of the populated list returns an empty page.
+    /// * `limit`  – maximum entries per page. Must be non-zero and at most
+    ///   `MAX_VERIFIER_LIST_LIMIT`. Returns `ListLimitExceeded` otherwise.
+    ///
+    /// # Privacy
+    ///
+    /// This is a read-only query equivalent to `get_verifier` — no private
+    /// witness values, credential secrets, nullifiers, or video hashes are
+    /// surfaced. An out-of-range cursor produces an empty page rather than a
+    /// revealing error, so a scanner cannot enumerate capacity by probing.
+    ///
+    /// # Migration / compatibility
+    ///
+    /// Additive: before any verifier is configured, returns an empty page.
+    /// Callers that only need the active verifier should use `get_verifier`.
+    pub fn list_verifiers(env: Env, cursor: u32, limit: u32) -> VerifierPage {
+        if limit == 0 || limit > MAX_VERIFIER_LIST_LIMIT {
+            panic_with_error!(&env, RegistryError::ListLimitExceeded);
+        }
+
+        // Build the ordered, flattened slot list from storage.
+        // Slots are built deterministically: Active → Pending → Previous.
+        // This avoids heap allocation of a variable-length list in no_std by
+        // using a fixed-size array of Option<VerifierEntry>.
+        let slots = collect_verifier_slots(&env);
+
+        // Count the total populated (non-None) slots across all positions.
+        let total_populated: u32 = slots.iter().filter(|s| s.is_some()).count() as u32;
+
+        let slot_len = slots.len() as u32;
+
+        // A cursor beyond the slot list always returns an empty page.
+        // This is intentional: it does not reveal the set size via an error.
+        let mut entries: SorobanVec<VerifierEntry> = SorobanVec::new(&env);
+        if cursor >= slot_len {
+            return VerifierPage {
+                entries,
+                next_cursor: None,
+                total_populated,
+            };
+        }
+
+        // Walk from `cursor` up to `limit` items, skipping None slots.
+        let mut idx = cursor;
+        let mut filled: u32 = 0;
+        while idx < slot_len && filled < limit {
+            if let Some(entry) = slots[idx as usize].clone() {
+                entries.push_back(entry);
+                filled += 1;
+            }
+            idx += 1;
+        }
+
+        // `next_cursor` is Some if there are any remaining slots (None or Some)
+        // that we have not yet reached. We only set it if there is actually
+        // a remaining populated slot; empty slots beyond are not worth paging.
+        let next_cursor = if idx < slot_len {
+            // Check whether any remaining slot is populated.
+            let has_more = slots[idx as usize..].iter().any(|s| s.is_some());
+            if has_more { Some(idx) } else { None }
+        } else {
+            None
+        };
+
+        VerifierPage {
+            entries,
+            next_cursor,
+            total_populated,
+        }
+    }
+}
+
+    // -----------------------------------------------------------------------
     // Dispute / correction state machine (#dispute)
     // -----------------------------------------------------------------------
 
@@ -4475,10 +4678,20 @@ fn get_issuer_record(env: &Env, issuer: &Address) -> IssuerRecord {
 }
 
 fn get_credential_root_record(env: &Env, credential_root: &BytesN<32>) -> CredentialRootRecord {
-    env.storage()
-        .persistent()
-        .get(&DataKey::CredentialRoot(credential_root.clone()))
-        .unwrap_or_else(|| panic_with_error!(env, RegistryError::UnknownCredentialRoot))
+    let key_v2 = DataKey::CredentialRootV2(credential_root.clone());
+    if let Some(record) = env.storage().persistent().get(&key_v2) {
+        return record;
+    }
+    let key_v1 = DataKey::CredentialRoot(credential_root.clone());
+    if let Some(v1) = env.storage().persistent().get::<_, CredentialRootRecordV1>(&key_v1) {
+        return CredentialRootRecord {
+            metadata_hash: v1.metadata_hash,
+            status: if v1.active { STATUS_REGISTERED } else { STATUS_REVOKED },
+            issued_at: v1.issued_at,
+            expires_at: 0,
+        };
+    }
+    panic_with_error!(env, RegistryError::UnknownCredentialRoot)
 }
 
 fn get_active_verifier(env: &Env) -> Address {
@@ -4503,10 +4716,53 @@ fn get_verifier_rotation_state(env: &Env) -> VerifierState {
         })
 }
 
+/// Build the ordered, fixed-size slot list for `list_verifiers`.
+///
+/// Returns exactly 3 entries in role order: [Active, Pending, Previous].
+/// Each entry is `None` if the corresponding slot is unpopulated.
+///
+/// The active slot is read from `DataKey::Verifier` (the canonical active
+/// address) first. If `DataKey::VerifierState` is present the pending and
+/// previous slots are taken from it. When the VerifierState carries an
+/// `active_verifier` that differs from `DataKey::Verifier` (e.g. mid-
+/// rotation) the `DataKey::Verifier` value is authoritative for the Active
+/// slot, matching the semantics of `get_verifier`.
+fn collect_verifier_slots(env: &Env) -> [Option<VerifierEntry>; 3] {
+    let active_addr: Option<Address> = env.storage().persistent().get(&DataKey::Verifier);
+
+    let state_opt: Option<VerifierState> =
+        env.storage().persistent().get(&DataKey::VerifierState);
+
+    let active_entry = active_addr.map(|addr| VerifierEntry {
+        address: addr,
+        role: VerifierRole::Active,
+    });
+
+    let (pending_entry, previous_entry) = match state_opt {
+        Some(state) => {
+            let pending = state.pending_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Pending,
+            });
+            let previous = state.previous_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Previous,
+            });
+            (pending, previous)
+        }
+        None => (None, None),
+    };
+
+    [active_entry, pending_entry, previous_entry]
+}
+
 fn require_active_credential_root(env: &Env, credential_root: &BytesN<32>) {
     let record = get_credential_root_record(env, credential_root);
-    if !record.active {
+    if record.status == STATUS_REVOKED {
         panic_with_error!(env, RegistryError::RevokedCredentialRoot);
+    }
+    if record.status == STATUS_EXPIRED || (record.expires_at > 0 && env.ledger().timestamp() >= record.expires_at) {
+        panic_with_error!(env, RegistryError::ExpiredCredentialRoot);
     }
 }
 
@@ -4806,9 +5062,48 @@ fn collect_lineage_parent_commitments(
             ));
             continue;
         }
-        panic_with_error!(env, RegistryError::InvalidLineage);
+        if check_lineage_cycle(env, &parent, output_digest) {
+            panic_with_error!(env, RegistryError::LineageCycle);
+        }
     }
-    commitments
+}
+
+fn check_lineage_cycle(env: &Env, proof_id: &BytesN<32>, target: &BytesN<32>) -> bool {
+    let mut visited = SorobanVec::new(env);
+    check_lineage_cycle_internal(env, proof_id, target, &mut visited, 1)
+}
+
+fn check_lineage_cycle_internal(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    target: &BytesN<32>,
+    visited: &mut SorobanVec<BytesN<32>>,
+    depth: u32,
+) -> bool {
+    if depth > MAX_LINEAGE_DEPTH {
+        return false;
+    }
+
+    if visited.iter().any(|v| v == *proof_id) {
+        return false;
+    }
+    visited.push_back(proof_id.clone());
+
+    if *proof_id == *target {
+        return true;
+    }
+
+    let lineage_key = DataKey::Lineage(proof_id.clone());
+    if env.storage().persistent().has(&lineage_key) {
+        let lineage: LineageRecord = env.storage().persistent().get(&lineage_key).unwrap();
+        for parent in lineage.parent_proof_ids.iter() {
+            if check_lineage_cycle_internal(env, &parent, target, visited, depth + 1) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Derive the deterministic sub-proof_id for batch element `index`.
@@ -5424,12 +5719,25 @@ fn dispatch_timelocked_action(env: &Env, proposal: &TimelockProposal) {
         }
         4 => {
             let mut record = get_credential_root_record(env, &proposal.payload);
-            record.active = false;
+            record.status = STATUS_REVOKED;
             env.storage()
                 .persistent()
-                .set(&DataKey::CredentialRoot(proposal.payload.clone()), &record);
+                .set(&DataKey::CredentialRootV2(proposal.payload.clone()), &record);
             CredentialRootRevoked {
                 credential_root: proposal.payload.clone(),
+            }
+            .publish(env);
+        }
+        5 => {
+            let mut record = get_credential_root_record(env, &proposal.payload);
+            record.status = STATUS_EXPIRED;
+            record.expires_at = env.ledger().timestamp();
+            env.storage()
+                .persistent()
+                .set(&DataKey::CredentialRootV2(proposal.payload.clone()), &record);
+            CredentialRootExpired {
+                credential_root: proposal.payload.clone(),
+                expired_at: record.expires_at,
             }
             .publish(env);
         }
@@ -5619,6 +5927,9 @@ pub mod test_timelock;
 #[cfg(test)]
 mod test_timestamp_claim;
 #[cfg(test)]
+mod test_selective_disclosure;
+#[cfg(test)]
+mod test_list_verifiers;
 mod test_upgrade_compat;
 #[cfg(test)]
 mod test_verifier_versions;

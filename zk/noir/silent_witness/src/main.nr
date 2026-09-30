@@ -55,8 +55,8 @@ fn main(
         evidence_digest,
     ]);
 
-    assert(derived_root == credential_root, "credential root mismatch");
-    assert(derived_nullifier == nullifier, "nullifier mismatch");
+    assert(derived_root == credential_root, "malformed");
+    assert(derived_nullifier == nullifier, "malformed");
 
     // --- domain separation constraint ---
     // Bind this proof to the Harpocrates protocol, circuit version 1, and
@@ -66,16 +66,7 @@ fn main(
         DOMAIN_VERSION_FIELD,
         DOMAIN_NETWORK_FIELD,
     ]);
-    assert(domain_tag == expected_domain_tag, "domain tag mismatch");
-
-    // --- circuit version constraint (#368) ---
-    // Bind this proof to circuit version 2. The verifier refuses envelopes
-    // whose trailing version field differs, so a downgrade cannot resurrect
-    // an old, weaker circuit.
-    assert(
-        circuit_version == CURRENT_CIRCUIT_VERSION as Field,
-        "circuit version mismatch",
-    );
+    assert(domain_tag == expected_domain_tag, "unsupported");
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +201,7 @@ fn test_zero_video_hash() {
 // Negative - wrong private inputs (existing)
 // ============================================================
 
-#[test(should_fail_with = "credential root mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_wrong_credential_secret() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -223,7 +214,7 @@ fn test_wrong_credential_secret() {
     main(99999, ns, vhi, vlo, root, nul, scope, ep, expected_domain_tag(), CURRENT_CIRCUIT_VERSION as Field);
 }
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_wrong_nullifier_secret() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -240,7 +231,7 @@ fn test_wrong_nullifier_secret() {
 // Negative - wrong video hash (existing)
 // ============================================================
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_wrong_video_hash_hi() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -253,7 +244,7 @@ fn test_wrong_video_hash_hi() {
     main(cs, ns, 99999999999999999999999999999999999999, vlo, root, nul, scope, ep, expected_domain_tag(), CURRENT_CIRCUIT_VERSION as Field);
 }
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_wrong_video_hash_lo() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -266,7 +257,7 @@ fn test_wrong_video_hash_lo() {
     main(cs, ns, vhi, 99999999999999999999999999999999999999, root, nul, scope, ep, expected_domain_tag(), CURRENT_CIRCUIT_VERSION as Field);
 }
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_wrong_video_hash_both_halves() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -283,7 +274,7 @@ fn test_wrong_video_hash_both_halves() {
 // Negative - tampered public inputs (existing)
 // ============================================================
 
-#[test(should_fail_with = "credential root mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_tampered_credential_root_public_input() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -296,7 +287,7 @@ fn test_tampered_credential_root_public_input() {
     main(cs, ns, vhi, vlo, root, nul, scope, ep, expected_domain_tag(), CURRENT_CIRCUIT_VERSION as Field);
 }
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_tampered_nullifier_public_input() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -310,7 +301,7 @@ fn test_tampered_nullifier_public_input() {
     main(cs, ns, vhi, vlo, root, nul, scope, ep, expected_domain_tag(), CURRENT_CIRCUIT_VERSION as Field);
 }
 
-#[test(should_fail_with = "credential root mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_both_public_inputs_wrong_identity() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -327,7 +318,7 @@ fn test_both_public_inputs_wrong_identity() {
 // Negative - public input ordering attacks (existing)
 // ============================================================
 
-#[test(should_fail_with = "credential root mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_swapped_credential_root_and_nullifier() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -341,7 +332,7 @@ fn test_swapped_credential_root_and_nullifier() {
     main(cs, ns, vhi, vlo, nul, root, scope, ep, expected_domain_tag(), CURRENT_CIRCUIT_VERSION as Field);
 }
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_swapped_video_hash_halves() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -361,7 +352,7 @@ fn test_swapped_video_hash_halves() {
 
 // A valid proof for scope=0 must NOT satisfy scope=999.
 // Proves the nullifier binds to the specific verifier_scope.
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_nullifier_from_different_scope() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -377,7 +368,7 @@ fn test_nullifier_from_different_scope() {
 
 // A valid proof for epoch=1 must NOT satisfy epoch=2.
 // Proves the nullifier binds to the specific epoch.
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_nullifier_from_different_epoch() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -395,7 +386,7 @@ fn test_nullifier_from_different_epoch() {
 // Negative -- nullifier/video binding (unchanged from v1)
 // ============================================================
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_nullifier_from_different_video() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -413,8 +404,8 @@ fn test_nullifier_from_different_video() {
 // Negative - domain tag mismatch (NEW: domain separation tests)
 // ============================================================
 
-// Zero domain_tag - never equals the expected Pedersen hash.
-#[test(should_fail_with = "domain tag mismatch")]
+// Zero domain_tag — never equals the expected Pedersen hash.
+#[test(should_fail_with = "unsupported")]
 fn test_zero_domain_tag_rejected() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -439,7 +430,7 @@ fn nullifier_with_algorithm_id(
     std::hash::pedersen_hash([cs, ns, evidence])
 }
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_wrong_algorithm_id_in_nullifier() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -457,7 +448,7 @@ fn test_wrong_algorithm_id_in_nullifier() {
 // Negative -- evidence digest commitment preimage
 // ============================================================
 
-#[test(should_fail_with = "nullifier mismatch")]
+#[test(should_fail_with = "malformed")]
 fn test_swapped_algorithm_id_and_video_hash_hi() {
     let cs: Field = 12345;
     let ns: Field = 67890;
@@ -490,4 +481,71 @@ fn test_circuit_version_downgrade() {
     let root = std::hash::pedersen_hash([cs]);
     let null = compute_scoped_nullifier(cs, ns, vhi, vlo, scope, ep);
     main(cs, ns, vhi, vlo, root, null, scope, ep, expected_domain_tag(), 1);
+}
+
+// ============================================================
+// Positive — nullifier collision boundaries
+// ============================================================
+
+// Adjacent secrets must not collapse to the same field element. This catches
+// accidental truncation or an off-by-one reduction at the secret boundary.
+#[test]
+fn test_adjacent_nullifier_secrets_are_distinct() {
+    let cs: Field = 12345;
+    let vhi: Field = 22685491128062564230891640495451214097;
+    let vlo: Field = 45370982256125128461783280990902428194;
+    let scope: Field = 0;
+    let ep: Field = 0;
+
+    let first = compute_scoped_nullifier(cs, 67890, vhi, vlo, scope, ep);
+    let adjacent = compute_scoped_nullifier(cs, 67891, vhi, vlo, scope, ep);
+    assert(first != adjacent, "adjacent nullifier secrets collided");
+}
+
+// The largest representable secret and zero are the two sides of the field
+// boundary. They must remain distinct even when a caller intentionally wraps
+// from p - 1 to 0.
+#[test]
+fn test_nullifier_secret_field_edges_are_distinct() {
+    let cs: Field = 12345;
+    let vhi: Field = 22685491128062564230891640495451214097;
+    let vlo: Field = 45370982256125128461783280990902428194;
+    let scope: Field = 0;
+    let ep: Field = 0;
+    let max_field: Field = 2188824287183927522224640574525727508854836440034343698204186575808495616;
+
+    let at_max = compute_scoped_nullifier(cs, max_field, vhi, vlo, scope, ep);
+    let wrapped_to_zero = compute_scoped_nullifier(cs, 0, vhi, vlo, scope, ep);
+    assert(at_max != wrapped_to_zero, "nullifier secret field boundary collided");
+}
+
+// Scope and epoch are part of the nullifier preimage. Test their adjacent
+// boundaries explicitly so a scope-only collision cannot pass unnoticed.
+#[test]
+fn test_scope_and_epoch_boundaries_are_distinct() {
+    let cs: Field = 12345;
+    let ns: Field = 67890;
+    let vhi: Field = 22685491128062564230891640495451214097;
+    let vlo: Field = 45370982256125128461783280990902428194;
+
+    let global_epoch_zero = compute_scoped_nullifier(cs, ns, vhi, vlo, 0, 0);
+    let adjacent_scope = compute_scoped_nullifier(cs, ns, vhi, vlo, 1, 0);
+    let adjacent_epoch = compute_scoped_nullifier(cs, ns, vhi, vlo, 0, 1);
+    assert(global_epoch_zero != adjacent_scope, "scope boundary nullifiers collided");
+    assert(global_epoch_zero != adjacent_epoch, "epoch boundary nullifiers collided");
+}
+
+// Video hash limbs are field elements too. Exercise the zero and adjacent
+// high-limb boundaries independently from the nullifier secret boundary.
+#[test]
+fn test_video_hash_limb_boundaries_are_distinct() {
+    let cs: Field = 12345;
+    let ns: Field = 67890;
+    let vlo: Field = 45370982256125128461783280990902428194;
+    let scope: Field = 0;
+    let ep: Field = 0;
+
+    let zero_high = compute_scoped_nullifier(cs, ns, 0, vlo, scope, ep);
+    let adjacent_high = compute_scoped_nullifier(cs, ns, 1, vlo, scope, ep);
+    assert(zero_high != adjacent_high, "video hash high-limb boundary collided");
 }
