@@ -1049,10 +1049,13 @@ pub const DOMAIN_NETWORK_FIELD: [u8; 32] = [
 /// Expected length of v1 public inputs (5 × 32 = 160 bytes, including domain_tag).
 const SILENT_WITNESS_V1_INPUT_LEN: u32 = 160;
 
-/// Expected length of the legacy bare v2 scoped frame (7 × 32 = 224 bytes,
-/// including domain_tag). It commits no circuit version, so the registry infers
-/// one from the length; see [`SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN`].
-const SILENT_WITNESS_V2_INPUT_LEN: u32 = 224;
+/// Length of the superseded bare v2 scoped frame (7 x 32 = 224 bytes, including
+/// domain_tag). It commits no circuit version, so a verifier could only *infer*
+/// one from the length. `register_anonymous_verified` rejects it outright with
+/// [`RegistryError::CircuitVersionMismatch`]; it is declared here only so that
+/// the rejection has a named, documented length instead of falling through to
+/// the generic `InvalidPublicInputs` arm.
+const SILENT_WITNESS_V2_BARE_INPUT_LEN: u32 = 224;
 
 /// Expected length of the circuit-versioned v2 envelope (#368): the 224-byte
 /// scoped frame plus a trailing 32-byte `circuit_version` field element. This
@@ -1060,12 +1063,17 @@ const SILENT_WITNESS_V2_INPUT_LEN: u32 = 224;
 /// from [`verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN`] rather than
 /// being restated here.
 ///
-/// [`HarpocratesRegistry::register_anonymous_verified`] accepts either this or
-/// the bare [`SILENT_WITNESS_V2_INPUT_LEN`]; a trailer other than
+/// [`HarpocratesRegistry::register_anonymous_verified`] accepts only this frame
+/// for the v2 path; a trailer other than
 /// [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] is rejected with
 /// [`RegistryError::CircuitVersionMismatch`].
 const SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN: u32 =
     verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32;
+
+/// Byte offset of the trailing `circuit_version` field inside the envelope: the
+/// envelope is the scoped frame followed by exactly one field element.
+const CIRCUIT_VERSION_TRAILER_OFFSET: usize =
+    verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN - verifier_inputs::FIELD_LEN;
 
 #[contractevent(topics = ["revroot", "set"])]
 pub struct RevocationRootSet {
@@ -1404,7 +1412,8 @@ pub enum RegistryError {
     /// The issuer rotation grace window has not lapsed yet (#323).
     IssuerRotationGraceStillActive = 86,
     /// A scoped-nullifier envelope carried a `circuit_version` trailer other
-    /// than [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] (#368).
+    /// than [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`], or was the superseded
+    /// bare 224-byte frame that commits no circuit version at all (#368).
     CircuitVersionMismatch = 87,
 }
 
@@ -2314,11 +2323,15 @@ impl HarpocratesRegistry {
 
         let input_len = public_inputs.len();
 
-        let record = if input_len == SILENT_WITNESS_V2_INPUT_LEN
-            || input_len == SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN
-        {
-            // v2 scoped nullifier path (with optional circuit-version envelope
-            // trailer, #368).
+        let record = if input_len == SILENT_WITNESS_V2_BARE_INPUT_LEN {
+            // The bare v2 frame predates #368 and commits no circuit version, so
+            // the verifier could only infer one from the length. Rejecting it by
+            // length here means a proof cannot dodge the version commitment by
+            // omitting the trailer.
+            panic_with_error!(&env, RegistryError::CircuitVersionMismatch);
+        } else if input_len == SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN {
+            // v2 scoped nullifier path; the circuit-version envelope trailer is
+            // mandatory (#368).
             let parsed = parse_scoped_silent_witness_public_inputs(&env, &public_inputs);
             if parsed.video_hash != video_hash {
                 panic_with_error!(&env, RegistryError::InvalidPublicInputs);
@@ -4897,37 +4910,31 @@ struct ScopedSilentWitnessInputs {
 }
 
 /// Parse the public-input blob produced by the v2 scoped silent_witness Noir
-/// circuit, optionally carrying the circuit-version envelope trailer (#368).
+/// circuit: the 256-byte envelope carrying the circuit-version trailer (#368).
 ///
-/// Both the bare 224-byte scoped frame and the 256-byte enveloped frame are
-/// accepted. The bare frame predates the commitment, so its circuit version is
-/// only *inferred* from the length. The enveloped frame appends a 32-byte
-/// `circuit_version` field that the producing circuit asserted in-circuit, so
-/// the proof names its own circuit; it must decode to
-/// [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] or the registration is rejected
-/// with [`RegistryError::CircuitVersionMismatch`].
+/// The envelope appends a 32-byte `circuit_version` field that the producing
+/// circuit asserted in-circuit, so the proof names its own circuit; it must
+/// decode to [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] or the registration
+/// is rejected with [`RegistryError::CircuitVersionMismatch`]. The superseded
+/// bare 224-byte frame is rejected at the dispatch in
+/// [`HarpocratesRegistry::register_anonymous_verified`] before this parser runs,
+/// so no proof can skip the version commitment.
 fn parse_scoped_silent_witness_public_inputs(
     env: &Env,
     public_inputs: &Bytes,
 ) -> ScopedSilentWitnessInputs {
     let input_len = public_inputs.len();
-    if input_len != SILENT_WITNESS_V2_INPUT_LEN
-        && input_len != SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN
-    {
+    if input_len != SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN {
         panic_with_error!(env, RegistryError::InvalidPublicInputs);
     }
 
     let mut bytes = [0u8; verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN];
-    public_inputs.copy_into_slice(&mut bytes[..input_len as usize]);
+    public_inputs.copy_into_slice(&mut bytes);
 
-    if input_len == SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN {
-        let mut trailer = [0u8; verifier_inputs::FIELD_LEN];
-        trailer.copy_from_slice(&bytes[SILENT_WITNESS_V2_INPUT_LEN as usize..]);
-        if verifier_inputs::circuit_version_of(&trailer)
-            != verifier_inputs::EXPECTED_CIRCUIT_VERSION
-        {
-            panic_with_error!(env, RegistryError::CircuitVersionMismatch);
-        }
+    let mut trailer = [0u8; verifier_inputs::FIELD_LEN];
+    trailer.copy_from_slice(&bytes[CIRCUIT_VERSION_TRAILER_OFFSET..]);
+    if verifier_inputs::circuit_version_of(&trailer) != verifier_inputs::EXPECTED_CIRCUIT_VERSION {
+        panic_with_error!(env, RegistryError::CircuitVersionMismatch);
     }
 
     // Reassemble video_hash: hi occupies bytes 16..32 of the first field word,

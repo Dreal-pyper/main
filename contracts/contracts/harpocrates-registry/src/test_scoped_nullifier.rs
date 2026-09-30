@@ -24,8 +24,11 @@ struct MockScopedVerifier;
 #[contractimpl]
 impl MockScopedVerifier {
     pub fn verify_proof(_env: Env, public_inputs: Bytes, proof: Bytes) {
-        // Accept the legal frame lengths: revocation (128), v1 silent (160),
-        // v2 scoped (224), and the circuit-versioned v2 envelope (256, #368).
+        // Stand-in for the barretenberg verifier: it models the frame lengths a
+        // verifier can *parse* (revocation 128, v1 silent 160, bare scoped 224,
+        // circuit-versioned envelope 256), not the registry's frame policy. The
+        // registry rejects the bare 224-byte frame before ever reaching this
+        // double (#368), so 224 here is only reachable from a direct call.
         let len = public_inputs.len();
         if !(matches!(len, 128 | 160 | 224 | 256)) || proof.is_empty() {
             panic!("invalid scoped proof");
@@ -113,9 +116,33 @@ fn fill_v2_frame(
     buf[192..224].copy_from_slice(&dt);
 }
 
-/// Build a v2 (224-byte) scoped silent witness public-input blob.
+/// Build the scoped public-input blob the registry accepts: the 256-byte
+/// circuit-versioned envelope (#368) naming `EXPECTED_CIRCUIT_VERSION`.
 #[cfg(test)]
 fn v2_public_inputs(
+    env: &Env,
+    video_hash: &BytesN<32>,
+    credential_root: &BytesN<32>,
+    nullifier: &BytesN<32>,
+    verifier_scope: &BytesN<32>,
+    epoch: u64,
+) -> Bytes {
+    enveloped_public_inputs(
+        env,
+        video_hash,
+        credential_root,
+        nullifier,
+        verifier_scope,
+        epoch,
+        verifier_inputs::EXPECTED_CIRCUIT_VERSION as u8,
+    )
+}
+
+/// Build the superseded bare 224-byte scoped frame: no `circuit_version`
+/// trailer, so it commits no circuit version at all. Rejected by length with
+/// `RegistryError::CircuitVersionMismatch` (#368).
+#[cfg(test)]
+fn bare_v2_public_inputs(
     env: &Env,
     video_hash: &BytesN<32>,
     credential_root: &BytesN<32>,
@@ -452,6 +479,68 @@ fn test_scoped_registration_zero_version_rejected() {
         &proof_buf(&env),
     );
 }
+
+/// The superseded bare 224-byte scoped frame commits no circuit version, so its
+/// version could only ever be inferred from its length. It is now rejected by
+/// that length, before the verifier is reached: a proof cannot skip the version
+/// commitment by omitting the trailer (#368).
+#[test]
+#[should_panic(expected = "Error(Contract, #87)")]
+fn test_scoped_registration_bare_frame_rejected() {
+    let (env, contract_id, _admin, credential_root) = init_scoped_registry();
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+
+    let video_hash = b32(&env, 0x80);
+    let nullifier = b32(&env, 0x81);
+    let scope = b32(&env, 0x00);
+
+    let pi = bare_v2_public_inputs(&env, &video_hash, &credential_root, &nullifier, &scope, 0);
+    assert_eq!(pi.len(), SILENT_WITNESS_V2_BARE_INPUT_LEN);
+
+    client.register_anonymous_verified(
+        &video_hash,
+        &b32(&env, 0x82),
+        &b32(&env, 0x83),
+        &pi,
+        &proof_buf(&env),
+    );
+}
+
+/// Truncating an otherwise-accepted envelope to its first seven fields — the
+/// exact downgrade the version commitment exists to stop — is rejected rather
+/// than reinterpreted as the legacy frame (#368).
+#[test]
+#[should_panic(expected = "Error(Contract, #87)")]
+fn test_scoped_registration_truncated_envelope_rejected() {
+    let (env, contract_id, _admin, credential_root) = init_scoped_registry();
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+
+    let video_hash = b32(&env, 0x84);
+    let nullifier = b32(&env, 0x85);
+    let scope = b32(&env, 0x00);
+
+    let envelope = enveloped_public_inputs(
+        &env,
+        &video_hash,
+        &credential_root,
+        &nullifier,
+        &scope,
+        0,
+        verifier_inputs::EXPECTED_CIRCUIT_VERSION as u8,
+    );
+    let mut bytes = [0u8; 256];
+    envelope.copy_into_slice(&mut bytes);
+    let truncated = Bytes::from_slice(&env, &bytes[..224]);
+
+    client.register_anonymous_verified(
+        &video_hash,
+        &b32(&env, 0x86),
+        &b32(&env, 0x87),
+        &truncated,
+        &proof_buf(&env),
+    );
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #53)")] // StaleEpoch
 fn test_scoped_rejects_stale_epoch() {
@@ -777,7 +866,8 @@ fn test_v1_v2_nullifiers_are_different() {
 // Rejects invalid input lengths
 // ===========================================================================
 
-/// Rejects public inputs that are neither 160 (v1) nor 224 (v2) bytes.
+/// Rejects a length no frame uses. The retired 224-byte bare frame has its own
+/// dedicated error; see `test_scoped_registration_bare_frame_rejected`.
 #[test]
 #[should_panic(expected = "Error(Contract, #10)")] // InvalidPublicInputs
 fn test_rejects_wrong_input_length() {

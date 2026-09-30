@@ -240,6 +240,7 @@ const ALL_VARIANTS: &[RegistryError] = &[
     RegistryError::InvalidIssuerRotation,
     RegistryError::IssuerRotationNotFound,
     RegistryError::IssuerRotationGraceStillActive,
+    RegistryError::CircuitVersionMismatch,
 ];
 
 #[cfg(test)]
