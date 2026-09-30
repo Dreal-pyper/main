@@ -5007,9 +5007,48 @@ fn collect_lineage_parent_commitments(
             ));
             continue;
         }
-        panic_with_error!(env, RegistryError::InvalidLineage);
+        if check_lineage_cycle(env, &parent, output_digest) {
+            panic_with_error!(env, RegistryError::LineageCycle);
+        }
     }
-    commitments
+}
+
+fn check_lineage_cycle(env: &Env, proof_id: &BytesN<32>, target: &BytesN<32>) -> bool {
+    let mut visited = SorobanVec::new(env);
+    check_lineage_cycle_internal(env, proof_id, target, &mut visited, 1)
+}
+
+fn check_lineage_cycle_internal(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    target: &BytesN<32>,
+    visited: &mut SorobanVec<BytesN<32>>,
+    depth: u32,
+) -> bool {
+    if depth > MAX_LINEAGE_DEPTH {
+        return false;
+    }
+
+    if visited.iter().any(|v| v == *proof_id) {
+        return false;
+    }
+    visited.push_back(proof_id.clone());
+
+    if *proof_id == *target {
+        return true;
+    }
+
+    let lineage_key = DataKey::Lineage(proof_id.clone());
+    if env.storage().persistent().has(&lineage_key) {
+        let lineage: LineageRecord = env.storage().persistent().get(&lineage_key).unwrap();
+        for parent in lineage.parent_proof_ids.iter() {
+            if check_lineage_cycle_internal(env, &parent, target, visited, depth + 1) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Derive the deterministic sub-proof_id for batch element `index`.
