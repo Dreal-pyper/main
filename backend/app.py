@@ -118,6 +118,7 @@ from tracing import (
     finish_request_span,
 )
 from readiness import ReadinessManager
+from verifier_cache import VerifierCache
 from admission import AdmissionController, require_capacity
 from webhook import WebhookWorker, queue_webhook_deliveries
 from quarantine import QuarantineError, isolate_upload, sniff_media_type_stream, sniff_media_type_path
@@ -199,6 +200,11 @@ def create_app() -> Flask:
         service_version=config.release_id,
     )
     app = Flask(__name__)
+    app.extensions["verifier_cache"] = VerifierCache(
+        max_size=config.verifier_cache_max_size,
+        positive_ttl_seconds=config.verifier_cache_positive_ttl_seconds,
+        negative_ttl_seconds=config.verifier_cache_negative_ttl_seconds,
+    )
     CORS(app, **cors_kwargs(config.cors_origins))
     app.config["MAX_CONTENT_LENGTH"] = config.max_content_length
     # Propagate the request id through every response (header + JSON body).
@@ -1178,6 +1184,10 @@ def create_app() -> Flask:
             }), 409
 
         if db_event and db_event.get("id") and created:
+            # A newly registered proof can change the on-chain verification
+            # result. Evict all cached results for this proof before clients
+            # perform the next verification lookup.
+            app.extensions["verifier_cache"].invalidate_proof(proof_id)
             queue_webhook_deliveries(db_event["id"])
             if normalized_tx_hash:
                 enqueue_job("verify_tx", {"proof_id": proof_id, "tx_hash": normalized_tx_hash, "contract_id": validated_contract_id})
