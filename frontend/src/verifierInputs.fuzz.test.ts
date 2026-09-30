@@ -357,8 +357,6 @@ describe('structured proof-hex decoding fuzz', () => {
   })
 
   it.each(SEEDS)('seed=%i proof rejection signals never echo mutant bytes', (seed) => {
-    const schema = SCHEMAS[0]
-    const frameHex = toHex(positiveFrames.get(schema)!)
     const rng = new Lcg(seed)
 
     for (let index = 0; index < 64; index += 1) {
